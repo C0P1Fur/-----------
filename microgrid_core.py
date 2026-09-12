@@ -783,35 +783,35 @@ def _write_matrix(ws, start_row: int, start_col: int, matrix):
             ws.cell(i, j).value = value
 
 
-def _template_purchase_values(q, day=None, next_day_first=None):
-    # 模板覆盖当天00:10至次日00:10，因此依次填入当天索引1至143和次日索引0
+def _template_purchase_values(q, day=None):
+    # 每行只取当天00:00至24:00的144个电量，不拼接次日数据
     values = np.asarray(q, dtype=float)
     if day is None:
         if values.shape != (144,):
             raise ValueError("典型日购电数组必须包含144个十分钟时段")
-        # 问题1每天条件相同，因此次日首时段复用典型日首时段
-        return values[1:].tolist() + [float(values[0])]
+        return values.tolist()
     if values.ndim != 2 or values.shape[1] != 144:
         raise ValueError("逐日购电数组必须采用日期乘144时段的二维形状")
-    if day + 1 < len(values):
-        tail = float(values[day + 1, 0])
-    elif next_day_first is not None:
-        tail = float(next_day_first)
-        if not np.isfinite(tail) or tail < 0:
-            raise ValueError("补充的次日首时段购电量必须是非负有限数值")
-    else:
-        import warnings
-        # 缺失次年首时段时保留空白，不能以零或本年首日数据替代未知购电量
-        warnings.warn("缺少最后一天的次日00:00—00:10购电量，模板对应末格留空", RuntimeWarning, stacklevel=2)
-        tail = None
-    return values[day, 1:].tolist() + [tail]
+    return values[day].tolist()
+
+
+def _check_calendar_template(ws, vertical=False):
+    # 写入前逐格核对时段，防止旧模板与新映射混用
+    for t in range(144):
+        start, end = t * 10, (t + 1) * 10
+        right = "0:00+1" if end == 1440 else f"{end // 60}:{end % 60:02d}"
+        expected = f"{start // 60}:{start % 60:02d}-{right}"
+        cell = ws.cell(t + 2, 1) if vertical else ws.cell(1, t + 2)
+        if cell.value != expected:
+            raise ValueError(f"模板时段不匹配：{ws.title}/{cell.coordinate}，请先运行fix_result_templates.py")
 
 
 def write_result1(template_path: str | Path, output_path: str | Path,
                   q, ch, dis, E):
     wb = load_workbook(template_path)
     ws_q = wb["计划购电量"]
-    # 保留模板标签，按典型日跨日顺序重新定位购电值
+    _check_calendar_template(ws_q, vertical=True)
+    # 第一格写q[0]，最后一格写q[143]
     for i, value in enumerate(_template_purchase_values(q), start=2):
         ws_q.cell(i, 2).value = float(value)
 
@@ -829,12 +829,13 @@ def write_result1(template_path: str | Path, output_path: str | Path,
 
 
 def write_result2(template_path: str | Path, output_path: str | Path,
-                  q, ch, dis, emergency, E, daily_cost, *, next_day_first=None):
+                  q, ch, dis, emergency, E, daily_cost):
     wb = load_workbook(template_path)
     ws = wb["计划购电量"]
-    # 时段列按模板跨日映射，日总量和费用仍按原来的日历日口径统计
+    _check_calendar_template(ws)
+    # 时段列和日汇总均采用当天零点至次日零点的相同统计口径
     rows = [
-        _template_purchase_values(q, d, next_day_first) + [float(q[d].sum()), float(daily_cost[d])]
+        _template_purchase_values(q, d) + [float(q[d].sum()), float(daily_cost[d])]
         for d in range(31, 365)
     ]
     _write_matrix(ws, 2, 2, rows)
@@ -845,20 +846,21 @@ def write_result2(template_path: str | Path, output_path: str | Path,
 
 
 def write_result3(template_path: str | Path, output_path: str | Path,
-                  q0, q, ch, dis, emergency, E, daily_cost, settlement_price,
-                  *, next_day_first_plan=None, next_day_first_adjusted=None):
+                  q0, q, ch, dis, emergency, E, daily_cost, settlement_price):
     wb = load_workbook(template_path)
+    _check_calendar_template(wb["计划购电量"])
+    _check_calendar_template(wb["调整购电量"])
     plan_rows = []
     adjust_rows = []
     for d in range(31, 365):
         # 原计划表末列只计算原日前购电费，不包含日内调整和应急费用
         plan_rows.append(
-            _template_purchase_values(q0, d, next_day_first_plan)
+            _template_purchase_values(q0, d)
             + [float(q0[d].sum()), float((settlement_price[d] * q0[d]).sum())]
         )
         # 调整表写最终常规购电量并在末列写入包含应急的实际总费用
         adjust_rows.append(
-            _template_purchase_values(q, d, next_day_first_adjusted)
+            _template_purchase_values(q, d)
             + [float(q[d].sum()), float(daily_cost[d])]
         )
 
