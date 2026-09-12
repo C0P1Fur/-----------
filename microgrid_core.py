@@ -709,72 +709,98 @@ def _excel_date_to_day_index(value: Any, epoch=None):
     return None
 
 
-def _fill_charge_sheet(wb, ch: np.ndarray, dis: np.ndarray, E: np.ndarray):
+def _report_days(wb):
+    # 使用完整购电表的日期确定报告范围，避免从带省略号的表推断日期
+    ws = wb["计划购电量"]
+    days = [_excel_date_to_day_index(ws.cell(r, 1).value, wb.epoch)
+            for r in range(2, ws.max_row + 1)]
+    if not days or any(d is None for d in days):
+        raise ValueError("计划购电量工作表存在无法识别的日期")
+    if days != list(range(days[0], days[-1] + 1)):
+        raise ValueError("计划购电量日期必须连续且不能重复")
+    return days
+
+
+def _reset_report_rows(ws, block_size):
+    from copy import copy
+    # 保留表头与列宽，并复制第一组示例的样式供新增日期复用
+    styles = [[copy(ws.cell(r, c)._style) for c in range(1, ws.max_column + 1)]
+              for r in range(2, block_size + 2)]
+    heights = [ws.row_dimensions[r].height for r in range(2, block_size + 2)]
+    if ws.merged_cells.ranges:
+        raise ValueError(f"{ws.title}存在合并单元格，请先核对布局")
+    ws.delete_rows(2, max(0, ws.max_row - 1))
+    for r in list(ws.row_dimensions):
+        if r >= 2:
+            del ws.row_dimensions[r]
+    return styles, heights
+
+
+def _append_report_row(ws, r, values, styles, height):
+    from copy import copy
+    for c, value in enumerate(values, 1):
+        cell = ws.cell(r, c)
+        cell.value = value
+        cell._style = copy(styles[c - 1])
+    ws.row_dimensions[r].height = height
+
+
+def _build_charge_report(wb, ch=None, dis=None, E=None):
+    from datetime import timedelta, time
+    days = _report_days(wb)
+    if ch is not None:
+        if any(np.asarray(a).ndim != 2 or len(a) <= days[-1] for a in (ch, dis, E)):
+            raise ValueError("充放电或储能数组未覆盖报告日期")
+        if ch.shape[1] != 144 or dis.shape[1] != 144 or E.shape[1] != 145:
+            raise ValueError("充放电应为144时段，储能状态应为145个边界")
     ws = wb["充放电量"]
-    blocks = {
-        "0:00-4:00": 0,
-        "4:00-8:00": 24,
-        "8:00-12:00": 48,
-        "12:00-16:00": 72,
-        "16:00-20:00": 96,
-        "20:00-24:00": 120,
-    }
-    current_day = None
-    # 按模板现有行扫描；只填模板已经列出的指定日期，保留原格式。
-    for r in range(2, ws.max_row + 1):
-        a = ws.cell(r, 1).value
-        if a == "⁝":
-            current_day = None
-        else:
-            idx = _excel_date_to_day_index(a, wb.epoch)
-            if idx is not None:
-                current_day = idx
-        if current_day is None or not (0 <= current_day < ch.shape[0]):
-            continue
+    styles, heights = _reset_report_rows(ws, 6)
+    r = 2
+    for day in days:
+        for b in range(6):
+            s = b * 24
+            # 每天首两行分别填写零点和24时储能，不依赖Excel时间的字符串形式
+            values = [datetime.combine(BASE_DATE + timedelta(days=day), time()) if b == 0 else None,
+                      f"{b*4}:00-{(b+1)*4}:00",
+                      None if ch is None else float(ch[day, s:s+24].sum()),
+                      None if dis is None else float(dis[day, s:s+24].sum()),
+                      time(0, 0) if b == 0 else ("24:00" if b == 1 else None),
+                      None if E is None or b > 1 else float(E[day, 0 if b == 0 else -1])]
+            _append_report_row(ws, r, values, styles[b], heights[b])
+            r += 1
 
-        period = ws.cell(r, 2).value
-        if period in blocks:
-            s = blocks[period]
-            ws.cell(r, 3).value = float(ch[current_day, s:s+24].sum())
-            ws.cell(r, 4).value = float(dis[current_day, s:s+24].sum())
 
-        marker = ws.cell(r, 5).value
-        # 当前分支仅按下面列出的零点和24时形式匹配时刻标记
-        marker_text = str(marker).strip() if marker is not None else ""
-        if marker == 0 or marker_text == "0:00":
-            ws.cell(r, 6).value = float(E[current_day, 0])
-        elif marker_text == "24:00":
-            ws.cell(r, 6).value = float(E[current_day, -1])
+def _build_emergency_report(wb, emergency=None):
+    from datetime import timedelta, time
+    days = _report_days(wb)
+    if emergency is not None and (np.asarray(emergency).ndim != 2 or
+                                 len(emergency) <= days[-1] or emergency.shape[1] != 144):
+        raise ValueError("紧急购电数组必须覆盖报告日期且每天包含144个时段")
+    ws = wb["紧急购电量"]
+    styles, heights = _reset_report_rows(ws, 3)
+    r = 2
+    for day in days:
+        runs = [] if emergency is None else positive_runs(emergency[day])
+        # 每天至少保留三行，实际事件更多时自动扩展且不截断任何区间
+        for j in range(max(3, len(runs))):
+            period, amount = None, None
+            if j < len(runs):
+                s, e, amount = runs[j]
+                period, amount = f"{_clock(s)}-{_clock(e)}", float(amount)
+            elif j == 0 and emergency is not None:
+                period, amount = "无", 0.0
+            values = [datetime.combine(BASE_DATE + timedelta(days=day), time()) if j == 0 else None,
+                      period, amount]
+            _append_report_row(ws, r, values, styles[min(j, 2)], heights[min(j, 2)])
+            r += 1
+
+
+def _fill_charge_sheet(wb, ch: np.ndarray, dis: np.ndarray, E: np.ndarray):
+    _build_charge_report(wb, ch, dis, E)
 
 
 def _fill_emergency_sheet(wb, emergency: np.ndarray):
-    ws = wb["紧急购电量"]
-    r = 2
-    max_row = ws.max_row
-    while r <= max_row:
-        day = _excel_date_to_day_index(ws.cell(r, 1).value, wb.epoch)
-        if day is None or not (0 <= day < emergency.shape[0]):
-            r += 1
-            continue
-
-        # 当前日期在模板中占用到下一条日期之前的所有空白行。
-        rr = r + 1
-        while rr <= max_row and ws.cell(rr, 1).value is None:
-            rr += 1
-        # 预留行数限制当前日期最多能写入多少段应急记录
-        capacity = rr - r
-
-        # 先清理模板中的旧示例值，避免残留。
-        for row in range(r, r + capacity):
-            ws.cell(row, 2).value = None
-            ws.cell(row, 3).value = None
-
-        runs = positive_runs(emergency[day])
-        # 当前实现只填入预留行能容纳的前几个区间，其余不会写入模板
-        for j, (s, e, amount) in enumerate(runs[:capacity]):
-            ws.cell(r + j, 2).value = f"{_clock(s)}-{_clock(e)}"
-            ws.cell(r + j, 3).value = float(amount)
-        r = rr
+    _build_emergency_report(wb, emergency)
 
 
 def _write_matrix(ws, start_row: int, start_col: int, matrix):
